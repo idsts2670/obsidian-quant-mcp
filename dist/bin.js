@@ -12,19 +12,47 @@ import { existsSync } from "fs";
 import path from "path";
 import matter from "gray-matter";
 var vaultPath = process.env.OBSIDIAN_VAULT_PATH || "";
+var vaultRealPath = "";
 function setVaultPath(p) {
   vaultPath = p;
 }
-function resolveVaultPath(relativePath) {
+async function resolveVaultPath(relativePath) {
   const normalized = path.normalize(relativePath);
   if (normalized.startsWith("..") || path.isAbsolute(normalized)) {
     throw new McpError(ErrorCode.InvalidParams, "Path traversal not allowed");
   }
-  return path.join(vaultPath, normalized);
+  const resolved = path.join(vaultPath, normalized);
+  try {
+    const real = await fs.realpath(resolved);
+    if (!real.startsWith(vaultRealPath + path.sep) && real !== vaultRealPath) {
+      throw new McpError(ErrorCode.InvalidParams, "Path traversal not allowed");
+    }
+  } catch (e) {
+    if (e instanceof McpError) throw e;
+    if ((e == null ? void 0 : e.code) === "ENOENT") {
+      try {
+        const parentReal = await fs.realpath(path.dirname(resolved));
+        if (!parentReal.startsWith(vaultRealPath + path.sep) && parentReal !== vaultRealPath) {
+          throw new McpError(ErrorCode.InvalidParams, "Path traversal not allowed");
+        }
+      } catch (e2) {
+        if (e2 instanceof McpError) throw e2;
+      }
+    }
+  }
+  return resolved;
 }
-async function ensureMd(filePath) {
+function ensureMd(filePath) {
   return filePath.endsWith(".md") ? filePath : filePath + ".md";
 }
+function requireString(args2, key) {
+  const val = args2 == null ? void 0 : args2[key];
+  if (typeof val !== "string") {
+    throw new McpError(ErrorCode.InvalidParams, `Missing or invalid parameter: ${key}`);
+  }
+  return val;
+}
+var MAX_SEARCH_RESULTS = 500;
 async function collectMarkdownFiles(dir) {
   const files = [];
   const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -34,7 +62,15 @@ async function collectMarkdownFiles(dir) {
     if (entry.isDirectory()) {
       files.push(...await collectMarkdownFiles(full));
     } else if (entry.name.endsWith(".md")) {
-      files.push(full);
+      if (entry.isSymbolicLink()) {
+        try {
+          const real = await fs.realpath(full);
+          if (real.startsWith(vaultRealPath + path.sep)) files.push(full);
+        } catch {
+        }
+      } else {
+        files.push(full);
+      }
     }
   }
   return files;
@@ -71,6 +107,21 @@ function applyTemplate(template, date, dateStr) {
 async function startServer() {
   if (!vaultPath) {
     console.error("Error: vault path required. Use --vault-path or OBSIDIAN_VAULT_PATH.");
+    process.exit(1);
+  }
+  try {
+    const stat = await fs.stat(vaultPath);
+    if (!stat.isDirectory()) {
+      console.error(`Error: vault path is not a directory: ${vaultPath}`);
+      process.exit(1);
+    }
+    vaultRealPath = await fs.realpath(vaultPath);
+  } catch (e) {
+    if ((e == null ? void 0 : e.code) === "ENOENT") {
+      console.error(`Error: vault path does not exist: ${vaultPath}`);
+    } else {
+      console.error(`Error: cannot access vault path: ${vaultPath}`, e);
+    }
     process.exit(1);
   }
   const server = new Server(
@@ -189,7 +240,7 @@ async function startServer() {
       switch (name) {
         // ── read_note ────────────────────────────────────────────────────────
         case "read_note": {
-          const notePath = await ensureMd(resolveVaultPath(args2 == null ? void 0 : args2.path));
+          const notePath = ensureMd(await resolveVaultPath(requireString(args2, "path")));
           const raw = await fs.readFile(notePath, "utf-8");
           const { data: frontmatter, content } = matter(raw);
           return {
@@ -205,44 +256,59 @@ async function startServer() {
         }
         // ── write_note ───────────────────────────────────────────────────────
         case "write_note": {
-          const notePath = await ensureMd(resolveVaultPath(args2 == null ? void 0 : args2.path));
+          const notePath = ensureMd(await resolveVaultPath(requireString(args2, "path")));
           await fs.mkdir(path.dirname(notePath), { recursive: true });
-          await fs.writeFile(notePath, args2 == null ? void 0 : args2.content, "utf-8");
+          await fs.writeFile(notePath, requireString(args2, "content"), "utf-8");
           return { content: [{ type: "text", text: JSON.stringify({ success: true, path: args2 == null ? void 0 : args2.path }) }] };
         }
         // ── append_note ──────────────────────────────────────────────────────
         case "append_note": {
-          const notePath = await ensureMd(resolveVaultPath(args2 == null ? void 0 : args2.path));
-          const existing = await fs.readFile(notePath, "utf-8");
+          const notePath = ensureMd(await resolveVaultPath(requireString(args2, "path")));
+          let existing;
+          try {
+            existing = await fs.readFile(notePath, "utf-8");
+          } catch (e) {
+            if ((e == null ? void 0 : e.code) === "ENOENT") {
+              throw new McpError(ErrorCode.InvalidParams, `Note not found: ${args2 == null ? void 0 : args2.path}`);
+            }
+            throw e;
+          }
           const { data: frontmatter, content } = matter(existing);
-          const updated = matter.stringify(content + "\n" + (args2 == null ? void 0 : args2.content), frontmatter);
+          const updated = matter.stringify(content + "\n" + requireString(args2, "content"), frontmatter);
           await fs.writeFile(notePath, updated, "utf-8");
           return { content: [{ type: "text", text: JSON.stringify({ success: true, path: args2 == null ? void 0 : args2.path }) }] };
         }
         // ── search_notes ─────────────────────────────────────────────────────
         case "search_notes": {
-          const query = (args2 == null ? void 0 : args2.query).toLowerCase();
+          const query = requireString(args2, "query").toLowerCase();
           const results = [];
           const allFiles = await collectMarkdownFiles(vaultPath);
-          for (const file of allFiles) {
+          outer: for (const file of allFiles) {
             const raw = await fs.readFile(file, "utf-8");
             const relPath = path.relative(vaultPath, file);
-            raw.split("\n").forEach((line, idx) => {
-              if (line.toLowerCase().includes(query)) {
-                results.push({ path: relPath, line: idx + 1, snippet: line.trim().slice(0, 200) });
+            const lines = raw.split("\n");
+            for (let idx = 0; idx < lines.length; idx++) {
+              if (results.length >= MAX_SEARCH_RESULTS) break outer;
+              if (lines[idx].toLowerCase().includes(query)) {
+                results.push({ path: relPath, line: idx + 1, snippet: lines[idx].trim().slice(0, 200) });
               }
-            });
+            }
           }
           return {
             content: [{
               type: "text",
-              text: JSON.stringify({ query, results, count: results.length }, null, 2)
+              text: JSON.stringify({
+                query,
+                results,
+                count: results.length,
+                truncated: results.length >= MAX_SEARCH_RESULTS
+              }, null, 2)
             }]
           };
         }
         // ── list_notes ───────────────────────────────────────────────────────
         case "list_notes": {
-          const base = (args2 == null ? void 0 : args2.directory) ? resolveVaultPath(args2.directory) : vaultPath;
+          const base = (args2 == null ? void 0 : args2.directory) ? await resolveVaultPath(args2.directory) : vaultPath;
           const notes = [];
           const entries = await fs.readdir(base, { withFileTypes: true });
           for (const entry of entries) {
@@ -261,14 +327,14 @@ async function startServer() {
         }
         // ── delete_note ──────────────────────────────────────────────────────
         case "delete_note": {
-          const notePath = await ensureMd(resolveVaultPath(args2 == null ? void 0 : args2.path));
+          const notePath = ensureMd(await resolveVaultPath(requireString(args2, "path")));
           await fs.unlink(notePath);
           return { content: [{ type: "text", text: JSON.stringify({ success: true, path: args2 == null ? void 0 : args2.path }) }] };
         }
         // ── get_backlinks ────────────────────────────────────────────────────
         case "get_backlinks": {
-          const targetRelPath = args2 == null ? void 0 : args2.path;
-          const targetAbs = await ensureMd(resolveVaultPath(targetRelPath));
+          const targetRelPath = requireString(args2, "path");
+          const targetAbs = ensureMd(await resolveVaultPath(targetRelPath));
           const targetBasename = path.basename(targetAbs, ".md").toLowerCase();
           const targetRelNorm = path.relative(vaultPath, targetAbs);
           const allFiles = await collectMarkdownFiles(vaultPath);
@@ -321,7 +387,7 @@ async function startServer() {
           await fs.mkdir(path.dirname(notePath), { recursive: true });
           let content;
           if (args2 == null ? void 0 : args2.template) {
-            const templatePath = await ensureMd(resolveVaultPath(args2.template));
+            const templatePath = ensureMd(await resolveVaultPath(args2.template));
             const templateRaw = await fs.readFile(templatePath, "utf-8");
             content = applyTemplate(templateRaw, date, dateStr);
           } else {
