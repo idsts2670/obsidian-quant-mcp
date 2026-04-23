@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-quant-mcp",
+  "version": "1.0.0",
+  "description": "Custom Obsidian MCP server with backlinks and daily note support — for Claude Code and Cursor",
+  "type": "module",
+  "bin": {
+    "obsidian-quant-mcp": "dist/bin.js"
+  },
+  "scripts": {
+    "build": "tsup src/bin.ts --format esm --platform node --out-dir dist --no-splitting",
+    "start": "node dist/bin.js",
+    "dev": "tsup src/bin.ts --format esm --platform node --out-dir dist --no-splitting --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
