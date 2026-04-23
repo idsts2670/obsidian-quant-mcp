@@ -7,9 +7,9 @@
     "obsidian-quant-mcp": "dist/bin.js"
   },
   "scripts": {
-    "build": "tsup src/bin.ts --format esm --platform node --out-dir dist --no-splitting",
+    "build": "tsup",
     "start": "node dist/bin.js",
-    "dev": "tsup src/bin.ts --format esm --platform node --out-dir dist --no-splitting --watch"
+    "dev": "tsup --watch"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
